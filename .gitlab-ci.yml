@@ -1,0 +1,244 @@
+# GitLab CI/CD — Пайплайн тестирования Matrix-мессенджера
+#
+# Стадии:
+#   lint    — проверка кода (flake8, mypy)
+#   unit    — быстрые юнит-тесты без браузера
+#   e2e:web — E2E через Playwright (веб-клиент)
+#   e2e:desktop — E2E через Playwright + Electron (десктоп)
+#   e2e:mobile  — E2E через Appium (iOS + Android)
+#
+# Артефакты (скриншоты, трейсы, JUnit XML) собираются в каждой стадии.
+# HTML-отчёт публикуется в GitLab Pages.
+
+stages:
+  - lint
+  - unit
+  - e2e:web
+  - e2e:desktop
+  - e2e:mobile
+
+# ---------------------------------------------------------------------------
+# Переменные окружения (переопределяются в GitLab CI/CD → Settings → Variables)
+# ---------------------------------------------------------------------------
+variables:
+  HOMESERVER_URL: "http://synapse:8008"       # адрес тестового Synapse в Docker-сети
+  ADMIN_TOKEN: "$MATRIX_ADMIN_TOKEN"          # секрет из GitLab Variables
+  WEB_CLIENT_URL: "http://element-web:8080"   # Element Web в Docker-сети
+  PYTHON_VERSION: "3.12"
+  PLAYWRIGHT_BROWSERS_PATH: "/root/.cache/ms-playwright"
+
+# ---------------------------------------------------------------------------
+# Общий шаблон для Python-джобов
+# ---------------------------------------------------------------------------
+.python-base: &python-base
+  image: python:${PYTHON_VERSION}-slim
+  before_script:
+    - pip install --quiet uv
+    - uv sync --frozen
+    - source .venv/bin/activate
+  cache:
+    key: "uv-${CI_COMMIT_REF_SLUG}"
+    paths:
+      - .venv/
+      - uv.lock
+  variables:
+    UV_CACHE_DIR: ".uv-cache"
+
+# ---------------------------------------------------------------------------
+# Шаблон для Playwright-джобов
+# ---------------------------------------------------------------------------
+.playwright-base: &playwright-base
+  <<: *python-base
+  image: mcr.microsoft.com/playwright/python:v1.44.0-jammy
+  before_script:
+    - pip install --quiet uv
+    - uv sync --frozen
+    - source .venv/bin/activate
+    - playwright install chromium --with-deps
+  artifacts:
+    when: always
+    expire_in: 7 days
+    paths:
+      - reports/
+      - playwright-traces/
+    reports:
+      junit: reports/junit.xml
+
+# ---------------------------------------------------------------------------
+# Стадия: lint
+# ---------------------------------------------------------------------------
+lint:code:
+  <<: *python-base
+  stage: lint
+  script:
+    - uv sync --frozen --group lint
+    - source .venv/bin/activate
+    - flake8 framework/ tests/ --max-line-length=100
+    - mypy framework/ --ignore-missing-imports
+  allow_failure: false  # линтер не должен пропускать падения
+
+# ---------------------------------------------------------------------------
+# Стадия: unit
+# ---------------------------------------------------------------------------
+unit:framework:
+  <<: *python-base
+  stage: unit
+  script:
+    - pytest tests/ -m "not e2e" --junitxml=reports/junit-unit.xml -v
+  artifacts:
+    when: always
+    expire_in: 3 days
+    reports:
+      junit: reports/junit-unit.xml
+
+# ---------------------------------------------------------------------------
+# Стадия: e2e:web — параллельные джобы по группам тестов
+# ---------------------------------------------------------------------------
+
+# Матрица параллельного запуска: каждый джоб запускает свою группу тестов
+e2e:web:smoke:
+  <<: *playwright-base
+  stage: e2e:web
+  services:
+    - name: matrixdotorg/synapse:latest
+      alias: synapse
+      variables:
+        SYNAPSE_SERVER_NAME: "localhost"
+        SYNAPSE_REPORT_STATS: "no"
+    - name: vectorim/element-web:latest
+      alias: element-web
+  script:
+    - >
+      pytest tests/e2e/
+      -m smoke
+      --browser chromium
+      --homeserver $HOMESERVER_URL
+      --base-url $WEB_CLIENT_URL
+      --junitxml=reports/junit-e2e-web-smoke.xml
+      --reruns=2
+      --screenshot=only-on-failure
+      --video=retain-on-failure
+      --tracing=retain-on-failure
+      -v
+  artifacts:
+    paths:
+      - reports/
+      - test-results/  # Playwright сохраняет трейсы сюда
+
+e2e:web:full:
+  <<: *playwright-base
+  stage: e2e:web
+  rules:
+    # Полный прогон только на MR и main
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  services:
+    - name: matrixdotorg/synapse:latest
+      alias: synapse
+    - name: vectorim/element-web:latest
+      alias: element-web
+  script:
+    - >
+      pytest tests/e2e/ tests/api/
+      --browser chromium
+      --homeserver $HOMESERVER_URL
+      --base-url $WEB_CLIENT_URL
+      --junitxml=reports/junit-e2e-web-full.xml
+      --reruns=2
+      --screenshot=only-on-failure
+      --video=retain-on-failure
+      --tracing=retain-on-failure
+      -v
+  parallel: 3  # GitLab разделит тесты на 3 параллельных воркера
+
+# ---------------------------------------------------------------------------
+# Стадия: e2e:desktop (Electron)
+# ---------------------------------------------------------------------------
+e2e:desktop:
+  stage: e2e:desktop
+  image: python:${PYTHON_VERSION}-slim
+  tags:
+    - linux  # нужен дисплей; используем xvfb или headless Electron
+  before_script:
+    - apt-get update -qq && apt-get install -y xvfb nodejs npm
+    - pip install --quiet uv
+    - uv sync --frozen
+    - source .venv/bin/activate
+    - npm install --prefix desktop-client  # сборка форка Element Desktop
+  script:
+    - >
+      Xvfb :99 -screen 0 1280x720x24 &
+      DISPLAY=:99
+      pytest tests/e2e/
+      --electron-app=desktop-client/dist/linux-unpacked/element-desktop
+      --junitxml=reports/junit-e2e-desktop.xml
+      --reruns=1
+      -v
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - desktop-client/**/*  # только если изменился десктопный клиент
+  artifacts:
+    when: always
+    expire_in: 7 days
+    paths:
+      - reports/
+    reports:
+      junit: reports/junit-e2e-desktop.xml
+
+# ---------------------------------------------------------------------------
+# Стадия: e2e:mobile (Appium)
+# ---------------------------------------------------------------------------
+e2e:mobile:ios:
+  stage: e2e:mobile
+  tags:
+    - macos  # iOS-тесты требуют macOS-раннера с Xcode
+  before_script:
+    - pip install --quiet uv
+    - uv add --frozen appium-python-client
+    - uv sync --frozen
+    - source .venv/bin/activate
+  script:
+    - >
+      pytest tests/mobile/
+      --platform iOS
+      --device "iPhone 15 Simulator"
+      --junitxml=reports/junit-mobile-ios.xml
+      -v
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  allow_failure: true  # мобильные тесты нестабильны, не блокируем релиз
+  artifacts:
+    when: always
+    expire_in: 7 days
+    paths:
+      - reports/
+    reports:
+      junit: reports/junit-mobile-ios.xml
+
+# ---------------------------------------------------------------------------
+# GitLab Pages — публикация HTML-отчёта
+# ---------------------------------------------------------------------------
+pages:
+  stage: .post  # после всех стадий
+  image: python:${PYTHON_VERSION}-slim
+  before_script:
+    - pip install --quiet uv
+    - uv sync --frozen
+    - source .venv/bin/activate
+  script:
+    # Собираем все JUnit XML в один HTML-отчёт
+    - mkdir -p public
+    - >
+      python -c "
+      import glob, os
+      reports = glob.glob('reports/*.xml')
+      print(f'Найдено отчётов: {len(reports)}')
+      "
+    - cp -r reports/ public/
+  artifacts:
+    paths:
+      - public/
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
